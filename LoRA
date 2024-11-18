@@ -1,0 +1,112 @@
+
+# Check if CUDA is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# KoBERT 모델과 토크나이저 로드
+model = BertModel.from_pretrained('monologg/kobert').to(device)
+tokenizer = BertTokenizer.from_pretrained('monologg/kobert')
+
+# 모든 파라미터 동결
+for param in model.parameters():
+    param.requires_grad = False
+
+# LoRA 레이어 정의
+class LoRALayer(nn.Module):
+    def __init__(self, input_dim, rank=8, alpha=16, dropout=0.05):
+        super(LoRALayer, self).__init__()
+        self.down_project = nn.Linear(input_dim, rank, bias=False)
+        self.up_project = nn.Linear(rank, input_dim, bias=False)
+        self.dropout = nn.Dropout(p=dropout)  # Dropout 추가
+
+        # Scaling Factor 추가
+        self.alpha = alpha
+        self.scaling = self.alpha / rank  # 스케일링 계산
+
+    def forward(self, x):
+        x = self.down_project(x)  # 차원 축소
+        x = self.dropout(x)       # Dropout 적용
+        return self.scaling * self.up_project(x)  # 스케일링 및 차원 복원
+
+# LoRA 레이어 초기화
+lora_layer = LoRALayer(input_dim=768, rank=16).to(device)
+
+# 데이터셋 정의
+class LiteraryMLMDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_length=512, mask_prob=0.15):
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.mask_prob = mask_prob
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        encoding = self.tokenizer(text, padding='max_length', truncation=True, max_length=self.max_length, return_tensors="pt")
+        input_ids = encoding['input_ids'].squeeze()
+
+        # MLM: 마스킹 생성
+        labels = input_ids.clone()
+        rand = torch.rand(input_ids.shape)
+        mask_arr = (rand < self.mask_prob) * (input_ids != self.tokenizer.cls_token_id) * \
+                   (input_ids != self.tokenizer.sep_token_id) * (input_ids != self.tokenizer.pad_token_id)
+
+        # 마스킹된 위치를 [MASK] 토큰으로 대체
+        input_ids[mask_arr] = self.tokenizer.mask_token_id
+
+        # 마스크된 위치의 정답은 그대로 남기고, 나머지는 -100으로 설정 (loss 계산 제외)
+        labels[~mask_arr] = -100
+        return {
+            'input_ids': input_ids.to(device),
+            'attention_mask': encoding['attention_mask'].squeeze().to(device),
+            'labels': labels.to(device)
+        }
+
+# DataLoader 생성
+texts = df['origin_text_list'].tolist()
+dataset = LiteraryMLMDataset(texts, tokenizer)
+dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+
+# 옵티마이저 설정 (LoRA 레이어만 학습)
+optimizer = torch.optim.AdamW(lora_layer.parameters(), lr=1e-4, weight_decay=0.01)
+
+# 학습 루프
+model.train()
+lora_layer.train()
+
+for epoch in range(3):
+    total_loss = 0
+    for batch in tqdm(dataloader, desc=f"Epoch {epoch+1} Progress"):
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        labels = batch['labels']
+
+        # 프리트레인된 KoBERT 모델에서 임베딩 추출
+        with torch.no_grad():  # KoBERT의 파라미터는 업데이트하지 않음
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            pretrained_embedding = outputs.last_hidden_state  # [batch_size, sequence_length, hidden_size]
+
+        # LoRA 레이어 통과
+        lora_embedding = lora_layer(pretrained_embedding)
+
+        # 프리트레인된 임베딩 +  LoRA 임베딩
+        combined_embedding = pretrained_embedding + lora_embedding
+
+        # 예측 layer에 위에서 계산된 임베딩 삽입
+        vocab_size = tokenizer.vocab_size
+        prediction_layer = nn.Linear(combined_embedding.size(-1), vocab_size).to(device)
+        predictions = prediction_layer(combined_embedding)
+
+        # 손실 계산
+        loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        loss = loss_fn(predictions.view(-1, vocab_size), labels.view(-1))
+
+        # 역전파 및 옵티마이저 단계
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        total_loss += loss.item()
+    print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader)}")
